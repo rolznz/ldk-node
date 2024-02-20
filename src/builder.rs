@@ -355,12 +355,10 @@ impl NodeBuilder {
 /// - Chain data is sourced from the Esplora endpoint `https://blockstream.info/api`
 /// - Gossip data is sourced via the peer-to-peer network
 #[derive(Debug)]
-#[cfg(feature = "uniffi")]
 pub struct ArcedNodeBuilder {
 	inner: RwLock<NodeBuilder>,
 }
 
-#[cfg(feature = "uniffi")]
 impl ArcedNodeBuilder {
 	/// Creates a new builder instance with the default configuration.
 	pub fn new() -> Self {

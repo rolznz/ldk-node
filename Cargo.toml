@@ -1,5 +1,5 @@
 [package]
-name = "ldk-node"
+name = "ldk_node"
 version = "0.2.1"
 authors = ["Elias Rohrer <dev@tnull.de>"]
 homepage = "https://lightningdevkit.org/"
@@ -14,8 +14,12 @@ categories = ["cryptography::cryptocurrencies"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-crate-type = ["lib", "staticlib", "cdylib"]
-name = "ldk_node"
+name = "ldk_node_bindings"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
 
 [profile.release-smaller]
 inherits = "release"
@@ -65,7 +69,10 @@ futures = "0.3"
 tokio = { version = "1", default-features = false, features = [ "rt-multi-thread", "time", "sync" ] }
 esplora-client = { version = "0.6", default-features = false }
 libc = "0.2"
-uniffi = { version = "0.26.0", features = ["build"], optional = true }
+#uniffi = { version = "0.25.0", features = ["build"], optional = true }
+uniffi_bindgen = "0.25.0"
+uniffi_macros = "0.25.0"
+uniffi = { version = "0.25.0", features = ["cli"] }
 
 [target.'cfg(vss)'.dependencies]
 vss-client = "0.2"
@@ -92,7 +99,9 @@ electrsd = { version = "0.26.0", features = ["legacy"] }
 clightningrpc = { version = "0.3.0-beta.8", default-features = false }
 
 [build-dependencies]
-uniffi = { version = "0.26.0", features = ["build"], optional = true }
+#uniffi = { version = "0.25.0", features = ["build", "cli"], optional = true }
+uniffi_build = { version = "0.25.0" }
+uniffi_bindgen = "0.25.0"
 
 [profile.release]
 panic = "abort"

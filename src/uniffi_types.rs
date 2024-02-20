@@ -8,7 +8,7 @@ use crate::{Node, SocketAddress, UserChannelId};
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::{Address, Txid};
+use bitcoin::{Address, Txid, Network};
 use lightning::ln::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning_invoice::{Bolt11Invoice, SignedRawBolt11Invoice};
 
@@ -180,6 +180,17 @@ impl UniffiCustomTypeConverter for SocketAddress {
 	type Builtin = String;
 	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
 		Ok(SocketAddress::from_str(&val).map_err(|_| Error::InvalidSocketAddress)?)
+	}
+
+	fn from_custom(obj: Self) -> Self::Builtin {
+		obj.to_string()
+	}
+}
+
+impl UniffiCustomTypeConverter for Network {
+	type Builtin = String;
+	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+		Ok(Network::from_str(&val).unwrap())
 	}
 
 	fn from_custom(obj: Self) -> Self::Builtin {

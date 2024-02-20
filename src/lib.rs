@@ -7,7 +7,7 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-#![crate_name = "ldk_node"]
+// #![crate_name = "ldk_node"]
 
 //! # LDK Node
 //! A ready-to-go Lightning node library built using [LDK](https://lightningdevkit.org/) and
@@ -68,12 +68,12 @@
 //! [`connect_open_channel`]: Node::connect_open_channel
 //! [`send_payment`]: Node::send_payment
 //!
-#![cfg_attr(not(feature = "uniffi"), deny(missing_docs))]
-#![deny(rustdoc::broken_intra_doc_links)]
-#![deny(rustdoc::private_intra_doc_links)]
-#![allow(bare_trait_objects)]
-#![allow(ellipsis_inclusive_range_patterns)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+// #![cfg_attr(not(feature = "uniffi"), deny(missing_docs))]
+// #![deny(rustdoc::broken_intra_doc_links)]
+// #![deny(rustdoc::private_intra_doc_links)]
+// #![allow(bare_trait_objects)]
+// #![allow(ellipsis_inclusive_range_patterns)]
+// #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 mod builder;
 mod error;
@@ -88,7 +88,6 @@ mod peer_store;
 mod sweep;
 mod tx_broadcaster;
 mod types;
-#[cfg(feature = "uniffi")]
 mod uniffi_types;
 mod wallet;
 
@@ -105,14 +104,10 @@ pub use types::ChannelConfig;
 
 pub use io::utils::generate_entropy_mnemonic;
 
-#[cfg(feature = "uniffi")]
 use {bip39::Mnemonic, bitcoin::OutPoint, lightning::ln::PaymentSecret, uniffi_types::*};
 
-#[cfg(feature = "uniffi")]
 pub use builder::ArcedNodeBuilder as Builder;
 pub use builder::BuildError;
-#[cfg(not(feature = "uniffi"))]
-pub use builder::NodeBuilder as Builder;
 
 use event::{EventHandler, EventQueue};
 use gossip::GossipSource;
@@ -158,7 +153,6 @@ use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-#[cfg(feature = "uniffi")]
 uniffi::include_scaffolding!("ldk_node");
 
 // Config defaults

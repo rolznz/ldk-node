@@ -145,14 +145,12 @@ pub(crate) fn random_config() -> Config {
 	config
 }
 
-#[cfg(feature = "uniffi")]
 type TestNode<K> = Arc<Node<K>>;
 #[cfg(not(feature = "uniffi"))]
 type TestNode<K> = Node<K>;
 
 macro_rules! setup_builder {
 	($builder: ident, $config: expr) => {
-		#[cfg(feature = "uniffi")]
 		let $builder = Builder::from_config($config.clone());
 		#[cfg(not(feature = "uniffi"))]
 		let mut $builder = Builder::from_config($config.clone());

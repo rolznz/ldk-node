@@ -1,4 +1,3 @@
 fn main() {
-	#[cfg(feature = "uniffi")]
-	uniffi::generate_scaffolding("bindings/ldk_node.udl").unwrap();
+	uniffi_build::generate_scaffolding("src/ldk_node.udl").unwrap();
 }
