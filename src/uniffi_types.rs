@@ -1,3 +1,12 @@
+pub use lightning::events::{ClosureReason, PaymentFailureReason};
+pub use lightning::ln::ChannelId;
+pub use lightning::ln::PaymentSecret;
+pub use lightning::util::string::UntrustedString;
+
+pub use bitcoin::{BlockHash, Network, OutPoint};
+
+pub use bip39::Mnemonic;
+
 use crate::UniffiCustomTypeConverter;
 
 use crate::error::Error;
@@ -8,11 +17,9 @@ use crate::{Node, SocketAddress, UserChannelId};
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::{Address, Txid, Network};
-use lightning::ln::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
+use bitcoin::{Address, Txid};
+use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning_invoice::{Bolt11Invoice, SignedRawBolt11Invoice};
-
-use bip39::Mnemonic;
 
 use std::convert::TryInto;
 use std::str::FromStr;
@@ -165,6 +172,17 @@ impl UniffiCustomTypeConverter for Txid {
 	}
 }
 
+impl UniffiCustomTypeConverter for BlockHash {
+	type Builtin = String;
+	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+		Ok(BlockHash::from_str(&val)?)
+	}
+
+	fn from_custom(obj: Self) -> Self::Builtin {
+		obj.to_string()
+	}
+}
+
 impl UniffiCustomTypeConverter for Mnemonic {
 	type Builtin = String;
 	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
@@ -191,6 +209,16 @@ impl UniffiCustomTypeConverter for Network {
 	type Builtin = String;
 	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
 		Ok(Network::from_str(&val).unwrap())
+	}
+	fn from_custom(obj: Self) -> Self::Builtin {
+		obj.to_string()
+	}
+}
+
+impl UniffiCustomTypeConverter for UntrustedString {
+	type Builtin = String;
+	fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+		Ok(UntrustedString(val))
 	}
 
 	fn from_custom(obj: Self) -> Self::Builtin {

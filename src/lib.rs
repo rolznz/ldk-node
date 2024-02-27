@@ -75,14 +75,18 @@
 // #![allow(ellipsis_inclusive_range_patterns)]
 // #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
+mod balance;
 mod builder;
+mod config;
 mod error;
 mod event;
 mod fee_estimator;
 mod gossip;
 mod hex_utils;
 pub mod io;
+mod liquidity;
 mod logger;
+mod message_handler;
 mod payment_store;
 mod peer_store;
 mod sweep;
@@ -96,6 +100,8 @@ pub use bitcoin;
 pub use lightning;
 pub use lightning_invoice;
 
+pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
+pub use config::{default_config, Config};
 pub use error::Error as NodeError;
 use error::Error;
 
@@ -104,15 +110,21 @@ pub use types::ChannelConfig;
 
 pub use io::utils::generate_entropy_mnemonic;
 
-use {bip39::Mnemonic, bitcoin::OutPoint, lightning::ln::PaymentSecret, uniffi_types::*};
+use {bip39::Mnemonic, bitcoin::OutPoint, lightning::ln::PaymentSecret};
+use uniffi_types::*;
 
 pub use builder::ArcedNodeBuilder as Builder;
 pub use builder::BuildError;
 
+use config::{
+	LDK_PAYMENT_RETRY_TIMEOUT, NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL,
+	RGS_SYNC_INTERVAL, WALLET_SYNC_INTERVAL_MINIMUM_SECS,
+};
 use event::{EventHandler, EventQueue};
 use gossip::GossipSource;
+use liquidity::LiquiditySource;
 use payment_store::PaymentStore;
-pub use payment_store::{PaymentDetails, PaymentDirection, PaymentStatus};
+pub use payment_store::{LSPFeeLimits, PaymentDetails, PaymentDirection, PaymentStatus};
 use peer_store::{PeerInfo, PeerStore};
 use types::{
 	Broadcaster, ChainMonitor, ChannelManager, FeeEstimator, KeysManager, NetworkGraph,
@@ -125,7 +137,8 @@ use logger::{log_error, log_info, log_trace, FilesystemLogger, Logger};
 use lightning::chain::Confirm;
 use lightning::ln::channelmanager::{self, PaymentId, RecipientOnionFields, Retry};
 use lightning::ln::msgs::SocketAddress;
-use lightning::ln::{ChannelId, PaymentHash, PaymentPreimage};
+use lightning::ln::{PaymentHash, PaymentPreimage};
+
 use lightning::sign::EntropySource;
 
 use lightning::util::persist::KVStore;
@@ -144,7 +157,7 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 
-use bitcoin::{Address, Network, Txid};
+use bitcoin::{Address, Txid};
 
 use rand::Rng;
 
@@ -154,133 +167,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 uniffi::include_scaffolding!("ldk_node");
-
-// Config defaults
-const DEFAULT_STORAGE_DIR_PATH: &str = "/tmp/ldk_node/";
-const DEFAULT_NETWORK: Network = Network::Bitcoin;
-const DEFAULT_CLTV_EXPIRY_DELTA: u32 = 144;
-const DEFAULT_BDK_WALLET_SYNC_INTERVAL_SECS: u64 = 80;
-const DEFAULT_LDK_WALLET_SYNC_INTERVAL_SECS: u64 = 30;
-const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
-const DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER: u64 = 3;
-const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Debug;
-
-// The 'stop gap' parameter used by BDK's wallet sync. This seems to configure the threshold
-// number of derivation indexes after which BDK stops looking for new scripts belonging to the wallet.
-const BDK_CLIENT_STOP_GAP: usize = 20;
-
-// The number of concurrent requests made against the API provider.
-const BDK_CLIENT_CONCURRENCY: u8 = 4;
-
-// The default Esplora server we're using.
-const DEFAULT_ESPLORA_SERVER_URL: &str = "https://blockstream.info/api";
-
-// The timeout after which we abandon retrying failed payments.
-const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
-
-// The time in-between peer reconnection attempts.
-const PEER_RECONNECTION_INTERVAL: Duration = Duration::from_secs(10);
-
-// The time in-between RGS sync attempts.
-const RGS_SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-// The time in-between node announcement broadcast attempts.
-const NODE_ANN_BCAST_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-// The lower limit which we apply to any configured wallet sync intervals.
-const WALLET_SYNC_INTERVAL_MINIMUM_SECS: u64 = 10;
-
-// The length in bytes of our wallets' keys seed.
-const WALLET_KEYS_SEED_LEN: usize = 64;
-
-#[derive(Debug, Clone)]
-/// Represents the configuration of an [`Node`] instance.
-///
-/// ### Defaults
-///
-/// | Parameter                              | Value              |
-/// |----------------------------------------|--------------------|
-/// | `storage_dir_path`                     | /tmp/ldk_node/     |
-/// | `log_dir_path`                         | None               |
-/// | `network`                              | Bitcoin            |
-/// | `listening_addresses`                  | None               |
-/// | `default_cltv_expiry_delta`            | 144                |
-/// | `onchain_wallet_sync_interval_secs`    | 80                 |
-/// | `wallet_sync_interval_secs`            | 30                 |
-/// | `fee_rate_cache_update_interval_secs`  | 600                |
-/// | `trusted_peers_0conf`                  | []                 |
-/// | `probing_liquidity_limit_multiplier`   | 3                  |
-/// | `log_level`                            | Debug              |
-///
-pub struct Config {
-	/// The path where the underlying LDK and BDK persist their data.
-	pub storage_dir_path: String,
-	/// The path where logs are stored.
-	///
-	/// If set to `None`, logs can be found in the `logs` subdirectory in [`Config::storage_dir_path`].
-	pub log_dir_path: Option<String>,
-	/// The used Bitcoin network.
-	pub network: Network,
-	/// The addresses on which the node will listen for incoming connections.
-	pub listening_addresses: Option<Vec<SocketAddress>>,
-	/// The default CLTV expiry delta to be used for payments.
-	pub default_cltv_expiry_delta: u32,
-	/// The time in-between background sync attempts of the onchain wallet, in seconds.
-	///
-	/// **Note:** A minimum of 10 seconds is always enforced.
-	pub onchain_wallet_sync_interval_secs: u64,
-	/// The time in-between background sync attempts of the LDK wallet, in seconds.
-	///
-	/// **Note:** A minimum of 10 seconds is always enforced.
-	pub wallet_sync_interval_secs: u64,
-	/// The time in-between background update attempts to our fee rate cache, in seconds.
-	///
-	/// **Note:** A minimum of 10 seconds is always enforced.
-	pub fee_rate_cache_update_interval_secs: u64,
-	/// A list of peers that we allow to establish zero confirmation channels to us.
-	///
-	/// **Note:** Allowing payments via zero-confirmation channels is potentially insecure if the
-	/// funding transaction ends up never being confirmed on-chain. Zero-confirmation channels
-	/// should therefore only be accepted from trusted peers.
-	pub trusted_peers_0conf: Vec<PublicKey>,
-	/// The liquidity factor by which we filter the outgoing channels used for sending probes.
-	///
-	/// Channels with available liquidity less than the required amount times this value won't be
-	/// used to send pre-flight probes.
-	pub probing_liquidity_limit_multiplier: u64,
-	/// The level at which we log messages.
-	///
-	/// Any messages below this level will be excluded from the logs.
-	pub log_level: LogLevel,
-}
-
-impl Default for Config {
-	fn default() -> Self {
-		Self {
-			storage_dir_path: DEFAULT_STORAGE_DIR_PATH.to_string(),
-			log_dir_path: None,
-			network: DEFAULT_NETWORK,
-			listening_addresses: None,
-			default_cltv_expiry_delta: DEFAULT_CLTV_EXPIRY_DELTA,
-			onchain_wallet_sync_interval_secs: DEFAULT_BDK_WALLET_SYNC_INTERVAL_SECS,
-			wallet_sync_interval_secs: DEFAULT_LDK_WALLET_SYNC_INTERVAL_SECS,
-			fee_rate_cache_update_interval_secs: DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS,
-			trusted_peers_0conf: Vec::new(),
-			probing_liquidity_limit_multiplier: DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER,
-			log_level: DEFAULT_LOG_LEVEL,
-		}
-	}
-}
-
-/// Returns a [`Config`] object populated with default values.
-///
-/// See the documentation of [`Config`] for more information on the used defaults.
-///
-/// This is mostly meant for use in bindings, in Rust this is synonymous with
-/// [`Config::default()`].
-pub fn default_config() -> Config {
-	Config::default()
-}
 
 /// The main interface object of LDK Node, wrapping the necessary LDK and BDK functionalities.
 ///
@@ -302,6 +188,7 @@ pub struct Node<K: KVStore + Sync + Send + 'static> {
 	keys_manager: Arc<KeysManager>,
 	network_graph: Arc<NetworkGraph>,
 	gossip_source: Arc<GossipSource>,
+	liquidity_source: Option<Arc<LiquiditySource<K, Arc<FilesystemLogger>>>>,
 	kv_store: Arc<K>,
 	logger: Arc<FilesystemLogger>,
 	_router: Arc<Router>,
@@ -343,11 +230,11 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 							now.elapsed().as_millis()
 						);
 						Ok(())
-					}
+					},
 					Err(e) => {
 						log_error!(sync_logger, "Initial fee rate cache update failed: {}", e,);
 						Err(e)
-					}
+					},
 				}
 			})
 		})?;
@@ -356,8 +243,10 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 		let wallet = Arc::clone(&self.wallet);
 		let sync_logger = Arc::clone(&self.logger);
 		let mut stop_sync = self.stop_receiver.clone();
-		let onchain_wallet_sync_interval_secs =
-			self.config.onchain_wallet_sync_interval_secs.max(WALLET_SYNC_INTERVAL_MINIMUM_SECS);
+		let onchain_wallet_sync_interval_secs = self
+			.config
+			.onchain_wallet_sync_interval_secs
+			.max(config::WALLET_SYNC_INTERVAL_MINIMUM_SECS);
 		std::thread::spawn(move || {
 			tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
 				async move {
@@ -584,9 +473,9 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 						}
 						_ = interval.tick() => {
 							let pm_peers = connect_pm
-								.get_peer_node_ids()
+								.list_peers()
 								.iter()
-								.map(|(peer, _addr)| *peer)
+								.map(|peer| peer.counterparty_node_id)
 								.collect::<Vec<_>>();
 							for node_id in connect_cm
 								.list_channels()
@@ -653,7 +542,7 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 								continue;
 							}
 
-							if bcast_pm.get_peer_node_ids().is_empty() {
+							if bcast_pm.list_peers().is_empty() {
 								// Skip if we don't have any connected peers to gossip to.
 								continue;
 							}
@@ -755,6 +644,21 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 			});
 		});
 
+		if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+			let mut stop_liquidity_handler = self.stop_receiver.clone();
+			let liquidity_handler = Arc::clone(&liquidity_source);
+			runtime.spawn(async move {
+				loop {
+					tokio::select! {
+						_ = stop_liquidity_handler.changed() => {
+							return;
+						}
+						_ = liquidity_handler.handle_next_event() => {}
+					}
+				}
+			});
+		}
+
 		*runtime_lock = Some(runtime);
 
 		log_info!(self.logger, "Startup complete.");
@@ -784,7 +688,7 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 					e
 				);
 				debug_assert!(false);
-			}
+			},
 		}
 
 		// Stop disconnect peers.
@@ -852,16 +756,6 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 		let funding_address = self.wallet.get_new_address()?;
 		log_info!(self.logger, "Generated new funding address: {}", funding_address);
 		Ok(funding_address)
-	}
-
-	/// Retrieve the currently spendable on-chain balance in satoshis.
-	pub fn spendable_onchain_balance_sats(&self) -> Result<u64, Error> {
-		Ok(self.wallet.get_balance().map(|bal| bal.get_spendable())?)
-	}
-
-	/// Retrieve the current total on-chain balance in satoshis.
-	pub fn total_onchain_balance_sats(&self) -> Result<u64, Error> {
-		Ok(self.wallet.get_balance().map(|bal| bal.get_total())?)
 	}
 
 	/// Send an on-chain payment to the given address.
@@ -945,10 +839,10 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 		log_info!(self.logger, "Disconnecting peer {}..", counterparty_node_id);
 
 		match self.peer_store.remove_peer(&counterparty_node_id) {
-			Ok(()) => {}
+			Ok(()) => {},
 			Err(e) => {
 				log_error!(self.logger, "Failed to remove peer {}: {}", counterparty_node_id, e)
-			}
+			},
 		}
 
 		self.peer_manager.disconnect_by_node_id(counterparty_node_id);
@@ -963,12 +857,12 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 	/// channel counterparty on channel open. This can be useful to start out with the balance not
 	/// entirely shifted to one side, therefore allowing to receive payments from the getgo.
 	///
-	/// Returns a temporary channel id.
+	/// Returns a [`UserChannelId`] allowing to locally keep track of the channel.
 	pub fn connect_open_channel(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<Arc<ChannelConfig>>,
 		announce_channel: bool,
-	) -> Result<(), Error> {
+	) -> Result<UserChannelId, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
 			return Err(Error::NotRunning);
@@ -1025,12 +919,12 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 					peer_info.node_id
 				);
 				self.peer_store.add_peer(peer_info)?;
-				Ok(())
-			}
+				Ok(UserChannelId(user_channel_id))
+			},
 			Err(e) => {
 				log_error!(self.logger, "Failed to initiate channel creation: {:?}", e);
 				Err(Error::ChannelCreationFailed)
-			}
+			},
 		}
 	}
 
@@ -1069,11 +963,11 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 								"Sync of on-chain wallet finished in {}ms.",
 								now.elapsed().as_millis()
 							);
-						}
+						},
 						Err(e) => {
 							log_error!(sync_logger, "Sync of on-chain wallet failed: {}", e);
 							return Err(e);
-						}
+						},
 					};
 
 					let now = Instant::now();
@@ -1085,11 +979,11 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 								now.elapsed().as_millis()
 							);
 							Ok(())
-						}
+						},
 						Err(e) => {
 							log_error!(sync_logger, "Sync of Lightning wallet failed: {}", e);
 							Err(e.into())
-						}
+						},
 					}
 				},
 			)
@@ -1098,27 +992,51 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 
 	/// Close a previously opened channel.
 	pub fn close_channel(
-		&self, channel_id: &ChannelId, counterparty_node_id: PublicKey,
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 	) -> Result<(), Error> {
-		self.peer_store.remove_peer(&counterparty_node_id)?;
-		match self.channel_manager.close_channel(&channel_id, &counterparty_node_id) {
-			Ok(_) => Ok(()),
-			Err(_) => Err(Error::ChannelClosingFailed),
+		let open_channels =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		if let Some(channel_details) =
+			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
+		{
+			match self
+				.channel_manager
+				.close_channel(&channel_details.channel_id, &counterparty_node_id)
+			{
+				Ok(_) => {
+					// Check if this was the last open channel, if so, forget the peer.
+					if open_channels.len() == 1 {
+						self.peer_store.remove_peer(&counterparty_node_id)?;
+					}
+					Ok(())
+				},
+				Err(_) => Err(Error::ChannelClosingFailed),
+			}
+		} else {
+			Ok(())
 		}
 	}
 
 	/// Update the config for a previously opened channel.
 	pub fn update_channel_config(
-		&self, channel_id: &ChannelId, counterparty_node_id: PublicKey,
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 		channel_config: Arc<ChannelConfig>,
 	) -> Result<(), Error> {
-		self.channel_manager
-			.update_channel_config(
-				&counterparty_node_id,
-				&[*channel_id],
-				&(*channel_config).clone().into(),
-			)
-			.map_err(|_| Error::ChannelConfigUpdateFailed)
+		let open_channels =
+			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
+		if let Some(channel_details) =
+			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
+		{
+			self.channel_manager
+				.update_channel_config(
+					&counterparty_node_id,
+					&[channel_details.channel_id],
+					&(*channel_config).clone().into(),
+				)
+				.map_err(|_| Error::ChannelConfigUpdateFailed)
+		} else {
+			Err(Error::ChannelConfigUpdateFailed)
+		}
 	}
 
 	/// Send a payment given an invoice.
@@ -1165,17 +1083,18 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 					amount_msat: invoice.amount_milli_satoshis(),
 					direction: PaymentDirection::Outbound,
 					status: PaymentStatus::Pending,
+					lsp_fee_limits: None,
 				};
 				self.payment_store.insert(payment)?;
 
 				Ok(payment_hash)
-			}
+			},
 			Err(e) => {
 				log_error!(self.logger, "Failed to send payment: {:?}", e);
 				match e {
 					channelmanager::RetryableSendFailure::DuplicatePayment => {
 						Err(Error::DuplicatePayment)
-					}
+					},
 					_ => {
 						let payment = PaymentDetails {
 							preimage: None,
@@ -1184,13 +1103,14 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 							amount_msat: invoice.amount_milli_satoshis(),
 							direction: PaymentDirection::Outbound,
 							status: PaymentStatus::Failed,
+							lsp_fee_limits: None,
 						};
 
 						self.payment_store.insert(payment)?;
 						Err(Error::PaymentSendingFailed)
-					}
+					},
 				}
-			}
+			},
 		}
 	}
 
@@ -1271,18 +1191,19 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 					amount_msat: Some(amount_msat),
 					direction: PaymentDirection::Outbound,
 					status: PaymentStatus::Pending,
+					lsp_fee_limits: None,
 				};
 				self.payment_store.insert(payment)?;
 
 				Ok(payment_hash)
-			}
+			},
 			Err(e) => {
 				log_error!(self.logger, "Failed to send payment: {:?}", e);
 
 				match e {
 					channelmanager::RetryableSendFailure::DuplicatePayment => {
 						Err(Error::DuplicatePayment)
-					}
+					},
 					_ => {
 						let payment = PaymentDetails {
 							hash: payment_hash,
@@ -1291,13 +1212,14 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 							amount_msat: Some(amount_msat),
 							direction: PaymentDirection::Outbound,
 							status: PaymentStatus::Failed,
+							lsp_fee_limits: None,
 						};
 						self.payment_store.insert(payment)?;
 
 						Err(Error::PaymentSendingFailed)
-					}
+					},
 				}
-			}
+			},
 		}
 	}
 
@@ -1345,18 +1267,19 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 					status: PaymentStatus::Pending,
 					direction: PaymentDirection::Outbound,
 					amount_msat: Some(amount_msat),
+					lsp_fee_limits: None,
 				};
 				self.payment_store.insert(payment)?;
 
 				Ok(payment_hash)
-			}
+			},
 			Err(e) => {
 				log_error!(self.logger, "Failed to send payment: {:?}", e);
 
 				match e {
 					channelmanager::RetryableSendFailure::DuplicatePayment => {
 						Err(Error::DuplicatePayment)
-					}
+					},
 					_ => {
 						let payment = PaymentDetails {
 							hash: payment_hash,
@@ -1365,13 +1288,14 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 							status: PaymentStatus::Failed,
 							direction: PaymentDirection::Outbound,
 							amount_msat: Some(amount_msat),
+							lsp_fee_limits: None,
 						};
 
 						self.payment_store.insert(payment)?;
 						Err(Error::PaymentSendingFailed)
-					}
+					},
 				}
-			}
+			},
 		}
 	}
 
@@ -1523,11 +1447,11 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 			Ok(inv) => {
 				log_info!(self.logger, "Invoice created: {}", inv);
 				inv
-			}
+			},
 			Err(e) => {
 				log_error!(self.logger, "Failed to create invoice: {}", e);
 				return Err(Error::InvoiceCreationFailed);
-			}
+			},
 		};
 
 		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
@@ -1538,9 +1462,140 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 			amount_msat,
 			direction: PaymentDirection::Inbound,
 			status: PaymentStatus::Pending,
+			lsp_fee_limits: None,
 		};
 
 		self.payment_store.insert(payment)?;
+
+		Ok(invoice)
+	}
+
+	/// Returns a payable invoice that can be used to request a payment of the amount given and
+	/// receive it via a newly created just-in-time (JIT) channel.
+	///
+	/// When the returned invoice is paid, the configured [LSPS2]-compliant LSP will open a channel
+	/// to us, supplying just-in-time inbound liquidity.
+	///
+	/// If set, `max_total_lsp_fee_limit_msat` will limit how much fee we allow the LSP to take for opening the
+	/// channel to us. We'll use its cheapest offer otherwise.
+	///
+	/// [LSPS2]: https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md
+	pub fn receive_payment_via_jit_channel(
+		&self, amount_msat: u64, description: &str, expiry_secs: u32,
+		max_total_lsp_fee_limit_msat: Option<u64>,
+	) -> Result<Bolt11Invoice, Error> {
+		self.receive_payment_via_jit_channel_inner(
+			Some(amount_msat),
+			description,
+			expiry_secs,
+			max_total_lsp_fee_limit_msat,
+			None,
+		)
+	}
+
+	/// Returns a payable invoice that can be used to request a variable amount payment (also known
+	/// as "zero-amount" invoice) and receive it via a newly created just-in-time (JIT) channel.
+	///
+	/// When the returned invoice is paid, the configured [LSPS2]-compliant LSP will open a channel
+	/// to us, supplying just-in-time inbound liquidity.
+	///
+	/// If set, `max_proportional_lsp_fee_limit_ppm_msat` will limit how much proportional fee, in
+	/// parts-per-million millisatoshis, we allow the LSP to take for opening the channel to us.
+	/// We'll use its cheapest offer otherwise.
+	///
+	/// [LSPS2]: https://github.com/BitcoinAndLightningLayerSpecs/lsp/blob/main/LSPS2/README.md
+	pub fn receive_variable_amount_payment_via_jit_channel(
+		&self, description: &str, expiry_secs: u32,
+		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>,
+	) -> Result<Bolt11Invoice, Error> {
+		self.receive_payment_via_jit_channel_inner(
+			None,
+			description,
+			expiry_secs,
+			None,
+			max_proportional_lsp_fee_limit_ppm_msat,
+		)
+	}
+
+	fn receive_payment_via_jit_channel_inner(
+		&self, amount_msat: Option<u64>, description: &str, expiry_secs: u32,
+		max_total_lsp_fee_limit_msat: Option<u64>,
+		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>,
+	) -> Result<Bolt11Invoice, Error> {
+		let liquidity_source =
+			self.liquidity_source.as_ref().ok_or(Error::LiquiditySourceUnavailable)?;
+
+		let (node_id, address) = liquidity_source
+			.get_liquidity_source_details()
+			.ok_or(Error::LiquiditySourceUnavailable)?;
+
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().unwrap();
+
+		let peer_info = PeerInfo { node_id, address };
+
+		let con_node_id = peer_info.node_id;
+		let con_addr = peer_info.address.clone();
+		let con_logger = Arc::clone(&self.logger);
+		let con_pm = Arc::clone(&self.peer_manager);
+
+		// We need to use our main runtime here as a local runtime might not be around to poll
+		// connection futures going forward.
+		tokio::task::block_in_place(move || {
+			runtime.block_on(async move {
+				connect_peer_if_necessary(con_node_id, con_addr, con_pm, con_logger).await
+			})
+		})?;
+
+		log_info!(self.logger, "Connected to LSP {}@{}. ", peer_info.node_id, peer_info.address);
+
+		let liquidity_source = Arc::clone(&liquidity_source);
+		let (invoice, lsp_total_opening_fee, lsp_prop_opening_fee) =
+			tokio::task::block_in_place(move || {
+				runtime.block_on(async move {
+					if let Some(amount_msat) = amount_msat {
+						liquidity_source
+							.lsps2_receive_to_jit_channel(
+								amount_msat,
+								description,
+								expiry_secs,
+								max_total_lsp_fee_limit_msat,
+							)
+							.await
+							.map(|(invoice, total_fee)| (invoice, Some(total_fee), None))
+					} else {
+						liquidity_source
+							.lsps2_receive_variable_amount_to_jit_channel(
+								description,
+								expiry_secs,
+								max_proportional_lsp_fee_limit_ppm_msat,
+							)
+							.await
+							.map(|(invoice, prop_fee)| (invoice, None, Some(prop_fee)))
+					}
+				})
+			})?;
+
+		// Register payment in payment store.
+		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+		let lsp_fee_limits = Some(LSPFeeLimits {
+			max_total_opening_fee_msat: lsp_total_opening_fee,
+			max_proportional_opening_fee_ppm_msat: lsp_prop_opening_fee,
+		});
+		let payment = PaymentDetails {
+			hash: payment_hash,
+			preimage: None,
+			secret: Some(invoice.payment_secret().clone()),
+			amount_msat,
+			direction: PaymentDirection::Inbound,
+			status: PaymentStatus::Pending,
+			lsp_fee_limits,
+		};
+
+		self.payment_store.insert(payment)?;
+
+		// Persist LSP peer to make sure we reconnect on restart.
+		self.peer_store.add_peer(peer_info)?;
 
 		Ok(invoice)
 	}
@@ -1555,6 +1610,51 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 	/// Remove the payment with the given hash from the store.
 	pub fn remove_payment(&self, payment_hash: &PaymentHash) -> Result<(), Error> {
 		self.payment_store.remove(&payment_hash)
+	}
+
+	/// Retrieves an overview of all known balances.
+	pub fn list_balances(&self) -> BalanceDetails {
+		let (total_onchain_balance_sats, spendable_onchain_balance_sats) = self
+			.wallet
+			.get_balance()
+			.map(|bal| (bal.get_total(), bal.get_spendable()))
+			.unwrap_or((0, 0));
+
+		let mut total_lightning_balance_sats = 0;
+		let mut lightning_balances = Vec::new();
+		for (funding_txo, channel_id) in self.chain_monitor.list_monitors() {
+			match self.chain_monitor.get_monitor(funding_txo) {
+				Ok(monitor) => {
+					let counterparty_node_id = monitor.get_counterparty_node_id().unwrap();
+					for ldk_balance in monitor.get_claimable_balances() {
+						total_lightning_balance_sats += ldk_balance.claimable_amount_satoshis();
+						lightning_balances.push(LightningBalance::from_ldk_balance(
+							channel_id,
+							counterparty_node_id,
+							ldk_balance,
+						));
+					}
+				},
+				Err(()) => {
+					continue;
+				},
+			}
+		}
+
+		let pending_balances_from_channel_closures = self
+			.output_sweeper
+			.tracked_spendable_outputs()
+			.into_iter()
+			.map(|o| PendingSweepBalance::from_tracked_spendable_output(o))
+			.collect();
+
+		BalanceDetails {
+			total_onchain_balance_sats,
+			spendable_onchain_balance_sats,
+			total_lightning_balance_sats,
+			lightning_balances,
+			pending_balances_from_channel_closures,
+		}
 	}
 
 	/// Retrieves all payments that match the given predicate.
@@ -1586,12 +1686,13 @@ impl<K: KVStore + Sync + Send + 'static> Node<K> {
 		let mut peers = Vec::new();
 
 		// First add all connected peers, preferring to list the connected address if available.
-		let connected_peers = self.peer_manager.get_peer_node_ids();
+		let connected_peers = self.peer_manager.list_peers();
 		let connected_peers_len = connected_peers.len();
-		for (node_id, con_addr_opt) in connected_peers {
+		for connected_peer in connected_peers {
+			let node_id = connected_peer.counterparty_node_id;
 			let stored_peer = self.peer_store.get_peer(&node_id);
 			let stored_addr_opt = stored_peer.as_ref().map(|p| p.address.clone());
-			let address = match (con_addr_opt, stored_addr_opt) {
+			let address = match (connected_peer.socket_address, stored_addr_opt) {
 				(Some(con_addr), _) => con_addr,
 				(None, Some(stored_addr)) => stored_addr,
 				(None, None) => continue,
@@ -1649,10 +1750,8 @@ async fn connect_peer_if_necessary<K: KVStore + Sync + Send + 'static>(
 	node_id: PublicKey, addr: SocketAddress, peer_manager: Arc<PeerManager<K>>,
 	logger: Arc<FilesystemLogger>,
 ) -> Result<(), Error> {
-	for (pman_node_id, _pman_addr) in peer_manager.get_peer_node_ids() {
-		if node_id == pman_node_id {
-			return Ok(());
-		}
+	if peer_manager.peer_by_node_id(&node_id).is_some() {
+		return Ok(());
 	}
 
 	do_connect_peer(node_id, addr, peer_manager, logger).await
@@ -1683,19 +1782,19 @@ async fn do_connect_peer<K: KVStore + Sync + Send + 'static>(
 					std::task::Poll::Ready(_) => {
 						log_info!(logger, "Peer connection closed: {}@{}", node_id, addr);
 						return Err(Error::ConnectionFailed);
-					}
-					std::task::Poll::Pending => {}
+					},
+					std::task::Poll::Pending => {},
 				}
 				// Avoid blocking the tokio context by sleeping a bit
-				match peer_manager.get_peer_node_ids().iter().find(|(id, _addr)| *id == node_id) {
+				match peer_manager.peer_by_node_id(&node_id) {
 					Some(_) => return Ok(()),
 					None => tokio::time::sleep(Duration::from_millis(10)).await,
 				}
 			}
-		}
+		},
 		None => {
 			log_error!(logger, "Failed to connect to peer: {}@{}", node_id, addr);
 			Err(Error::ConnectionFailed)
-		}
+		},
 	}
 }

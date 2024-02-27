@@ -21,7 +21,7 @@ pub enum Error {
 	ChannelCreationFailed,
 	/// A channel could not be closed.
 	ChannelClosingFailed,
-	/// A channel config could not be updated.
+	/// A channel configuration could not be updated.
 	ChannelConfigUpdateFailed,
 	/// Persistence failed.
 	PersistenceFailed,
@@ -37,6 +37,8 @@ pub enum Error {
 	TxSyncFailed,
 	/// A gossip updating operation failed.
 	GossipUpdateFailed,
+	/// A liquidity request operation failed.
+	LiquidityRequestFailed,
 	/// The given address is invalid.
 	InvalidAddress,
 	/// The given network address is invalid.
@@ -47,7 +49,7 @@ pub enum Error {
 	InvalidSecretKey,
 	/// The given payment hash is invalid.
 	InvalidPaymentHash,
-	/// The given payment preimage is invalid.
+	/// The given payment pre-image is invalid.
 	InvalidPaymentPreimage,
 	/// The given payment secret is invalid.
 	InvalidPaymentSecret,
@@ -59,10 +61,14 @@ pub enum Error {
 	InvalidChannelId,
 	/// The given network is invalid.
 	InvalidNetwork,
-	/// A payment with the given hash has already been intiated.
+	/// A payment with the given hash has already been initiated.
 	DuplicatePayment,
-	/// There are insufficient funds to complete the given operation.
+	/// The available funds are insufficient to complete the given operation.
 	InsufficientFunds,
+	/// The given operation failed due to the required liquidity source being unavailable.
+	LiquiditySourceUnavailable,
+	/// The given operation failed due to the LSP's required opening fee being too high.
+	LiquidityFeeTooHigh,
 }
 
 impl fmt::Display for Error {
@@ -72,7 +78,7 @@ impl fmt::Display for Error {
 			Self::NotRunning => write!(f, "Node is not running."),
 			Self::OnchainTxCreationFailed => {
 				write!(f, "On-chain transaction could not be created.")
-			}
+			},
 			Self::ConnectionFailed => write!(f, "Network connection closed."),
 			Self::InvoiceCreationFailed => write!(f, "Failed to create invoice."),
 			Self::PaymentSendingFailed => write!(f, "Failed to send the given payment."),
@@ -83,12 +89,13 @@ impl fmt::Display for Error {
 			Self::PersistenceFailed => write!(f, "Failed to persist data."),
 			Self::FeerateEstimationUpdateFailed => {
 				write!(f, "Failed to update fee rate estimates.")
-			}
+			},
 			Self::WalletOperationFailed => write!(f, "Failed to conduct wallet operation."),
 			Self::OnchainTxSigningFailed => write!(f, "Failed to sign given transaction."),
 			Self::MessageSigningFailed => write!(f, "Failed to sign given message."),
 			Self::TxSyncFailed => write!(f, "Failed to sync transactions."),
 			Self::GossipUpdateFailed => write!(f, "Failed to update gossip data."),
+			Self::LiquidityRequestFailed => write!(f, "Failed to request inbound liquidity."),
 			Self::InvalidAddress => write!(f, "The given address is invalid."),
 			Self::InvalidSocketAddress => write!(f, "The given network address is invalid."),
 			Self::InvalidPublicKey => write!(f, "The given public key is invalid."),
@@ -102,10 +109,16 @@ impl fmt::Display for Error {
 			Self::InvalidNetwork => write!(f, "The given network is invalid."),
 			Self::DuplicatePayment => {
 				write!(f, "A payment with the given hash has already been initiated.")
-			}
+			},
 			Self::InsufficientFunds => {
-				write!(f, "There are insufficient funds to complete the given operation.")
-			}
+				write!(f, "The available funds are insufficient to complete the given operation.")
+			},
+			Self::LiquiditySourceUnavailable => {
+				write!(f, "The given operation failed due to the required liquidity source being unavailable.")
+			},
+			Self::LiquidityFeeTooHigh => {
+				write!(f, "The given operation failed due to the LSP's required opening fee being too high.")
+			},
 		}
 	}
 }

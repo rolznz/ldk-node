@@ -34,10 +34,10 @@ macro_rules! expect_event {
 			ref e @ Event::$event_type { .. } => {
 				println!("{} got event {:?}", $node.node_id(), e);
 				$node.event_handled();
-			}
+			},
 			ref e => {
 				panic!("{} got unexpected event!: {:?}", std::stringify!($node), e);
-			}
+			},
 		}
 	}};
 }
@@ -52,10 +52,10 @@ macro_rules! expect_channel_pending_event {
 				assert_eq!(counterparty_node_id, $counterparty_node_id);
 				$node.event_handled();
 				funding_txo
-			}
+			},
 			ref e => {
 				panic!("{} got unexpected event!: {:?}", std::stringify!($node), e);
-			}
+			},
 		}
 	}};
 }
@@ -65,15 +65,15 @@ pub(crate) use expect_channel_pending_event;
 macro_rules! expect_channel_ready_event {
 	($node: expr, $counterparty_node_id: expr) => {{
 		match $node.wait_next_event() {
-			ref e @ Event::ChannelReady { channel_id, counterparty_node_id, .. } => {
+			ref e @ Event::ChannelReady { user_channel_id, counterparty_node_id, .. } => {
 				println!("{} got event {:?}", $node.node_id(), e);
 				assert_eq!(counterparty_node_id, Some($counterparty_node_id));
 				$node.event_handled();
-				channel_id
-			}
+				user_channel_id
+			},
 			ref e => {
 				panic!("{} got unexpected event!: {:?}", std::stringify!($node), e);
-			}
+			},
 		}
 	}};
 }
@@ -213,7 +213,7 @@ pub(crate) fn wait_for_block<E: ElectrumApi>(electrs: &E, min_height: usize) {
 			// and panic if it still fails.
 			std::thread::sleep(Duration::from_secs(3));
 			electrs.block_headers_subscribe().expect("failed to subscribe to block headers")
-		}
+		},
 	};
 	loop {
 		if header.height >= min_height {
@@ -266,9 +266,9 @@ where
 			Some(data) => break data,
 			None if delay.as_millis() < 512 => {
 				delay = delay.mul_f32(2.0);
-			}
+			},
 
-			None => {}
+			None => {},
 		}
 		assert!(tries < 20, "Reached max tries.");
 		tries += 1;
@@ -331,8 +331,8 @@ pub(crate) fn do_channel_full_cycle<K: KVStore + Sync + Send, E: ElectrumApi>(
 	);
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-	assert_eq!(node_a.spendable_onchain_balance_sats().unwrap(), premine_amount_sat);
-	assert_eq!(node_b.spendable_onchain_balance_sats().unwrap(), premine_amount_sat);
+	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
+	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 
 	// Check we haven't got any events yet
 	assert_eq!(node_a.next_event(), None);
@@ -369,13 +369,13 @@ pub(crate) fn do_channel_full_cycle<K: KVStore + Sync + Send, E: ElectrumApi>(
 	let onchain_fee_buffer_sat = 1500;
 	let node_a_upper_bound_sat = premine_amount_sat - funding_amount_sat;
 	let node_a_lower_bound_sat = premine_amount_sat - funding_amount_sat - onchain_fee_buffer_sat;
-	assert!(node_a.spendable_onchain_balance_sats().unwrap() < node_a_upper_bound_sat);
-	assert!(node_a.spendable_onchain_balance_sats().unwrap() > node_a_lower_bound_sat);
-	assert_eq!(node_b.spendable_onchain_balance_sats().unwrap(), premine_amount_sat);
+	assert!(node_a.list_balances().spendable_onchain_balance_sats < node_a_upper_bound_sat);
+	assert!(node_a.list_balances().spendable_onchain_balance_sats > node_a_lower_bound_sat);
+	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 
 	expect_channel_ready_event!(node_a, node_b.node_id());
 
-	let channel_id = expect_channel_ready_event!(node_b, node_a.node_id());
+	let user_channel_id = expect_channel_ready_event!(node_b, node_a.node_id());
 
 	println!("\nB receive_payment");
 	let invoice_amount_1_msat = 2500_000;
@@ -443,10 +443,10 @@ pub(crate) fn do_channel_full_cycle<K: KVStore + Sync + Send, E: ElectrumApi>(
 			println!("{} got event {:?}", std::stringify!(node_b), e);
 			node_b.event_handled();
 			amount_msat
-		}
+		},
 		ref e => {
 			panic!("{} got unexpected event!: {:?}", std::stringify!(node_b), e);
-		}
+		},
 	};
 	assert_eq!(received_amount, overpaid_amount_msat);
 	assert_eq!(node_a.payment(&payment_hash).unwrap().status, PaymentStatus::Succeeded);
@@ -471,10 +471,10 @@ pub(crate) fn do_channel_full_cycle<K: KVStore + Sync + Send, E: ElectrumApi>(
 			println!("{} got event {:?}", std::stringify!(node_b), e);
 			node_b.event_handled();
 			amount_msat
-		}
+		},
 		ref e => {
 			panic!("{} got unexpected event!: {:?}", std::stringify!(node_b), e);
-		}
+		},
 	};
 	assert_eq!(received_amount, determined_amount_msat);
 	assert_eq!(node_a.payment(&payment_hash).unwrap().status, PaymentStatus::Succeeded);
@@ -495,10 +495,10 @@ pub(crate) fn do_channel_full_cycle<K: KVStore + Sync + Send, E: ElectrumApi>(
 			println!("{} got event {:?}", std::stringify!(node_b), e);
 			node_b.event_handled();
 			amount_msat
-		}
+		},
 		ref e => {
 			panic!("{} got unexpected event!: {:?}", std::stringify!(node_b), e);
-		}
+		},
 	};
 	assert_eq!(received_keysend_amount, keysend_amount_msat);
 	assert_eq!(node_a.payment(&keysend_payment_hash).unwrap().status, PaymentStatus::Succeeded);
@@ -518,7 +518,7 @@ pub(crate) fn do_channel_full_cycle<K: KVStore + Sync + Send, E: ElectrumApi>(
 	);
 
 	println!("\nB close_channel");
-	node_b.close_channel(&channel_id, node_a.node_id()).unwrap();
+	node_b.close_channel(&user_channel_id, node_a.node_id()).unwrap();
 	expect_event!(node_a, ChannelClosed);
 	expect_event!(node_b, ChannelClosed);
 
@@ -537,10 +537,13 @@ pub(crate) fn do_channel_full_cycle<K: KVStore + Sync + Send, E: ElectrumApi>(
 	let node_a_upper_bound_sat =
 		(premine_amount_sat - funding_amount_sat) + (funding_amount_sat - sum_of_all_payments_sat);
 	let node_a_lower_bound_sat = node_a_upper_bound_sat - onchain_fee_buffer_sat;
-	assert!(node_a.spendable_onchain_balance_sats().unwrap() > node_a_lower_bound_sat);
-	assert!(node_a.spendable_onchain_balance_sats().unwrap() < node_a_upper_bound_sat);
+	assert!(node_a.list_balances().spendable_onchain_balance_sats > node_a_lower_bound_sat);
+	assert!(node_a.list_balances().spendable_onchain_balance_sats < node_a_upper_bound_sat);
 	let expected_final_amount_node_b_sat = premine_amount_sat + sum_of_all_payments_sat;
-	assert_eq!(node_b.spendable_onchain_balance_sats().unwrap(), expected_final_amount_node_b_sat);
+	assert_eq!(
+		node_b.list_balances().spendable_onchain_balance_sats,
+		expected_final_amount_node_b_sat
+	);
 
 	// Check we handled all events
 	assert_eq!(node_a.next_event(), None);
@@ -598,12 +601,12 @@ impl TestSyncStore {
 				assert_eq!(list, test_list);
 
 				Ok(list)
-			}
+			},
 			Err(e) => {
 				assert!(sqlite_res.is_err());
 				assert!(test_res.is_err());
 				Err(e)
-			}
+			},
 		}
 	}
 }
@@ -623,14 +626,14 @@ impl KVStore for TestSyncStore {
 				assert_eq!(read, sqlite_res.unwrap());
 				assert_eq!(read, test_res.unwrap());
 				Ok(read)
-			}
+			},
 			Err(e) => {
 				assert!(sqlite_res.is_err());
 				assert_eq!(e.kind(), unsafe { sqlite_res.unwrap_err_unchecked().kind() });
 				assert!(test_res.is_err());
 				assert_eq!(e.kind(), unsafe { test_res.unwrap_err_unchecked().kind() });
 				Err(e)
-			}
+			},
 		}
 	}
 
@@ -652,12 +655,12 @@ impl KVStore for TestSyncStore {
 				assert!(sqlite_res.is_ok());
 				assert!(test_res.is_ok());
 				Ok(())
-			}
+			},
 			Err(e) => {
 				assert!(sqlite_res.is_err());
 				assert!(test_res.is_err());
 				Err(e)
-			}
+			},
 		}
 	}
 
@@ -680,12 +683,12 @@ impl KVStore for TestSyncStore {
 				assert!(sqlite_res.is_ok());
 				assert!(test_res.is_ok());
 				Ok(())
-			}
+			},
 			Err(e) => {
 				assert!(sqlite_res.is_err());
 				assert!(test_res.is_err());
 				Err(e)
-			}
+			},
 		}
 	}
 

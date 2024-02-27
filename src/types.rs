@@ -1,4 +1,5 @@
 use crate::logger::FilesystemLogger;
+use crate::message_handler::NodeCustomMessageHandler;
 use crate::sweep::OutputSweeper;
 
 use lightning::blinded_path::BlindedPath;
@@ -11,7 +12,7 @@ use lightning::ln::ChannelId;
 use lightning::routing::gossip;
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
-use lightning::sign::{EntropySource, InMemorySigner};
+use lightning::sign::InMemorySigner;
 use lightning::util::config::ChannelConfig as LdkChannelConfig;
 use lightning::util::config::MaxDustHTLCExposure as LdkMaxDustHTLCExposure;
 use lightning::util::ser::{Readable, Writeable, Writer};
@@ -25,7 +26,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub(crate) type ChainMonitor<K> = chainmonitor::ChainMonitor<
 	InMemorySigner,
-	Arc<EsploraSyncClient<Arc<FilesystemLogger>>>,
+	Arc<ChainSource>,
 	Arc<Broadcaster>,
 	Arc<FeeEstimator>,
 	Arc<FilesystemLogger>,
@@ -38,8 +39,16 @@ pub(crate) type PeerManager<K> = lightning::ln::peer_handler::PeerManager<
 	Arc<dyn RoutingMessageHandler + Send + Sync>,
 	Arc<OnionMessenger>,
 	Arc<FilesystemLogger>,
-	IgnoringMessageHandler,
+	Arc<NodeCustomMessageHandler<K, Arc<FilesystemLogger>>>,
 	Arc<KeysManager>,
+>;
+
+pub(crate) type ChainSource = EsploraSyncClient<Arc<FilesystemLogger>>;
+
+pub(crate) type LiquidityManager<K> = lightning_liquidity::LiquidityManager<
+	Arc<KeysManager>,
+	Arc<ChannelManager<K>>,
+	Arc<ChainSource>,
 >;
 
 pub(crate) type ChannelManager<K> = lightning::ln::channelmanager::ChannelManager<
@@ -74,6 +83,7 @@ pub(crate) type KeysManager = crate::wallet::WalletKeysManager<
 pub(crate) type Router = DefaultRouter<
 	Arc<NetworkGraph>,
 	Arc<FilesystemLogger>,
+	Arc<KeysManager>,
 	Arc<Mutex<Scorer>>,
 	ProbabilisticScoringFeeParameters,
 	Scorer,
@@ -118,12 +128,8 @@ impl lightning::onion_message::messenger::MessageRouter for FakeMessageRouter {
 	) -> Result<lightning::onion_message::messenger::OnionMessagePath, ()> {
 		unimplemented!()
 	}
-	fn create_blinded_paths<
-		ES: EntropySource + ?Sized,
-		T: secp256k1::Signing + secp256k1::Verification,
-	>(
-		&self, _recipient: PublicKey, _peers: Vec<PublicKey>, _entropy_source: &ES,
-		_secp_ctx: &Secp256k1<T>,
+	fn create_blinded_paths<T: secp256k1::Signing + secp256k1::Verification>(
+		&self, _recipient: PublicKey, _peers: Vec<PublicKey>, _secp_ctx: &Secp256k1<T>,
 	) -> Result<Vec<BlindedPath>, ()> {
 		unreachable!()
 	}
@@ -132,7 +138,7 @@ impl lightning::onion_message::messenger::MessageRouter for FakeMessageRouter {
 pub(crate) type Sweeper<K> = OutputSweeper<
 	Arc<Broadcaster>,
 	Arc<FeeEstimator>,
-	Arc<EsploraSyncClient<Arc<FilesystemLogger>>>,
+	Arc<ChainSource>,
 	Arc<K>,
 	Arc<FilesystemLogger>,
 >;
@@ -191,12 +197,6 @@ pub struct ChannelDetails {
 	/// The currently negotiated fee rate denominated in satoshi per 1000 weight units,
 	/// which is applied to commitment and HTLC transactions.
 	pub feerate_sat_per_1000_weight: u32,
-	/// The total balance of the channel. This is the amount that will be returned to
-	/// the user if the channel is closed.
-	///
-	/// The value is not exact, due to potential in-flight and fee-rate changes. Therefore, exactly
-	/// this amount is likely irrecoverable on close.
-	pub balance_msat: u64,
 	/// The available outbound capacity for sending HTLCs to the remote peer.
 	///
 	/// The amount does not include any pending HTLCs which are not yet resolved (and, thus, whose
@@ -261,8 +261,8 @@ pub struct ChannelDetails {
 	/// the current state and per-HTLC limit(s). This is intended for use when routing, allowing us
 	/// to use a limit as close as possible to the HTLC limit we can currently send.
 	///
-	/// See also [`ChannelDetails::next_outbound_htlc_minimum_msat`],
-	/// [`ChannelDetails::balance_msat`], and [`ChannelDetails::outbound_capacity_msat`].
+	/// See also [`ChannelDetails::next_outbound_htlc_minimum_msat`] and
+	/// [`ChannelDetails::outbound_capacity_msat`].
 	pub next_outbound_htlc_limit_msat: u64,
 	/// The minimum value for sending a single HTLC to the remote peer. This is the equivalent of
 	/// [`ChannelDetails::next_outbound_htlc_limit_msat`] but represents a lower-bound, rather than
@@ -297,7 +297,6 @@ impl From<LdkChannelDetails> for ChannelDetails {
 			// unwrap safety: This value will be `None` for objects serialized with LDK versions
 			// prior to 0.0.115.
 			feerate_sat_per_1000_weight: value.feerate_sat_per_1000_weight.unwrap(),
-			balance_msat: value.balance_msat,
 			outbound_capacity_msat: value.outbound_capacity_msat,
 			inbound_capacity_msat: value.inbound_capacity_msat,
 			confirmations_required: value.confirmations_required,

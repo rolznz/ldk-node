@@ -14,8 +14,8 @@ use crate::io::{
 use crate::logger::{log_error, log_info, Logger};
 
 use lightning::chain::chaininterface::ConfirmationTarget;
-use lightning::events::Event as LdkEvent;
-use lightning::events::PaymentPurpose;
+use lightning::events::{ClosureReason, PaymentPurpose};
+use lightning::events::{Event as LdkEvent, PaymentFailureReason};
 use lightning::impl_writeable_tlv_based_enum;
 use lightning::ln::{ChannelId, PaymentHash};
 use lightning::routing::gossip::NodeId;
@@ -23,12 +23,16 @@ use lightning::util::errors::APIError;
 use lightning::util::persist::KVStore;
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
 
+use lightning_liquidity::lsps2::utils::compute_opening_fee;
+
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::OutPoint;
+
+use rand::{thread_rng, Rng};
+
 use core::future::Future;
 use core::task::{Poll, Waker};
-use rand::{thread_rng, Rng};
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -48,6 +52,10 @@ pub enum Event {
 	PaymentFailed {
 		/// The hash of the payment.
 		payment_hash: PaymentHash,
+		/// The reason why the payment failed.
+		///
+		/// This will be `None` for events serialized by LDK Node v0.2.1 and prior.
+		reason: Option<PaymentFailureReason>,
 	},
 	/// A payment has been received.
 	PaymentReceived {
@@ -77,7 +85,7 @@ pub enum Event {
 		user_channel_id: UserChannelId,
 		/// The `node_id` of the channel counterparty.
 		///
-		/// This will be `None` for events serialized by LDK Node XXX TODO and prior.
+		/// This will be `None` for events serialized by LDK Node v0.1.0 and prior.
 		counterparty_node_id: Option<PublicKey>,
 	},
 	/// A channel has been closed.
@@ -88,8 +96,10 @@ pub enum Event {
 		user_channel_id: UserChannelId,
 		/// The `node_id` of the channel counterparty.
 		///
-		/// This will be `None` for events serialized by LDK Node XXX TODO and prior.
+		/// This will be `None` for events serialized by LDK Node v0.1.0 and prior.
 		counterparty_node_id: Option<PublicKey>,
+		/// This will be `None` for events serialized by LDK Node v0.2.1 and prior.
+		reason: Option<ClosureReason>,
 	},
 }
 
@@ -99,6 +109,7 @@ impl_writeable_tlv_based_enum!(Event,
 	},
 	(1, PaymentFailed) => {
 		(0, payment_hash, required),
+		(1, reason, option),
 	},
 	(2, PaymentReceived) => {
 		(0, payment_hash, required),
@@ -120,6 +131,7 @@ impl_writeable_tlv_based_enum!(Event,
 		(0, channel_id, required),
 		(1, counterparty_node_id, option),
 		(2, user_channel_id, required),
+		(3, reason, upgradable_option),
 	};
 );
 
@@ -349,27 +361,27 @@ where
 							&counterparty_node_id,
 							final_tx,
 						) {
-							Ok(()) => {}
+							Ok(()) => {},
 							Err(APIError::APIMisuseError { err }) => {
 								log_error!(self.logger, "Panicking due to APIMisuseError: {}", err);
 								panic!("APIMisuseError: {}", err);
-							}
+							},
 							Err(APIError::ChannelUnavailable { err }) => {
 								log_error!(
 									self.logger,
 									"Failed to process funding transaction as channel went away before we could fund it: {}",
 									err
 								)
-							}
+							},
 							Err(err) => {
 								log_error!(
 									self.logger,
 									"Failed to process funding transaction: {:?}",
 									err
 								)
-							}
+							},
 						}
-					}
+					},
 					Err(err) => {
 						log_error!(self.logger, "Failed to create funding transaction: {}", err);
 						self.channel_manager
@@ -383,9 +395,9 @@ where
 									"Failed to force close channel after funding generation failed"
 								);
 							});
-					}
+					},
 				}
-			}
+			},
 			LdkEvent::PaymentClaimable {
 				payment_hash,
 				purpose,
@@ -395,7 +407,7 @@ where
 				via_user_channel_id: _,
 				claim_deadline: _,
 				onion_fields: _,
-				counterparty_skimmed_fee_msat: _,
+				counterparty_skimmed_fee_msat,
 			} => {
 				if let Some(info) = self.payment_store.get(&payment_hash) {
 					if info.status == PaymentStatus::Succeeded {
@@ -404,6 +416,39 @@ where
 							"Refused duplicate inbound payment from payment hash {} of {}msat",
 							hex_utils::to_string(&payment_hash.0),
 							amount_msat,
+						);
+						self.channel_manager.fail_htlc_backwards(&payment_hash);
+
+						let update = PaymentDetailsUpdate {
+							status: Some(PaymentStatus::Failed),
+							..PaymentDetailsUpdate::new(payment_hash)
+						};
+						self.payment_store.update(&update).unwrap_or_else(|e| {
+							log_error!(self.logger, "Failed to access payment store: {}", e);
+							panic!("Failed to access payment store");
+						});
+						return;
+					}
+
+					let max_total_opening_fee_msat = info
+						.lsp_fee_limits
+						.and_then(|l| {
+							l.max_total_opening_fee_msat.or_else(|| {
+								l.max_proportional_opening_fee_ppm_msat.and_then(|max_prop_fee| {
+									// If it's a variable amount payment, compute the actual fee.
+									compute_opening_fee(amount_msat, 0, max_prop_fee)
+								})
+							})
+						})
+						.unwrap_or(0);
+
+					if counterparty_skimmed_fee_msat > max_total_opening_fee_msat {
+						log_info!(
+							self.logger,
+							"Refusing inbound payment with hash {} as the counterparty-withheld fee of {}msat exceeds our limit of {}msat",
+							hex_utils::to_string(&payment_hash.0),
+							counterparty_skimmed_fee_msat,
+							max_total_opening_fee_msat,
 						);
 						self.channel_manager.fail_htlc_backwards(&payment_hash);
 
@@ -434,7 +479,7 @@ where
 								.get_payment_preimage(payment_hash, payment_secret)
 								.ok()
 						}
-					}
+					},
 					PaymentPurpose::SpontaneousPayment(preimage) => Some(preimage),
 				};
 
@@ -457,7 +502,7 @@ where
 						panic!("Failed to access payment store");
 					});
 				}
-			}
+			},
 			LdkEvent::PaymentClaimed {
 				payment_hash,
 				purpose,
@@ -490,7 +535,7 @@ where
 									hex_utils::to_string(&payment_hash.0)
 								);
 								debug_assert!(false);
-							}
+							},
 							Err(e) => {
 								log_error!(
 									self.logger,
@@ -499,9 +544,9 @@ where
 									e
 								);
 								debug_assert!(false);
-							}
+							},
 						}
-					}
+					},
 					PaymentPurpose::SpontaneousPayment(preimage) => {
 						let payment = PaymentDetails {
 							preimage: Some(preimage),
@@ -510,6 +555,7 @@ where
 							amount_msat: Some(amount_msat),
 							direction: PaymentDirection::Inbound,
 							status: PaymentStatus::Succeeded,
+							lsp_fee_limits: None,
 						};
 
 						match self.payment_store.insert(payment) {
@@ -521,7 +567,7 @@ where
 									hex_utils::to_string(&payment_hash.0)
 								);
 								debug_assert!(false);
-							}
+							},
 							Err(e) => {
 								log_error!(
 									self.logger,
@@ -530,9 +576,9 @@ where
 									e
 								);
 								debug_assert!(false);
-							}
+							},
 						}
-					}
+					},
 				};
 
 				self.event_queue
@@ -541,7 +587,7 @@ where
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
 						panic!("Failed to push to event queue");
 					});
-			}
+			},
 			LdkEvent::PaymentSent { payment_preimage, payment_hash, fee_paid_msat, .. } => {
 				if let Some(mut payment) = self.payment_store.get(&payment_hash) {
 					payment.preimage = Some(payment_preimage);
@@ -570,12 +616,13 @@ where
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
 						panic!("Failed to push to event queue");
 					});
-			}
-			LdkEvent::PaymentFailed { payment_hash, .. } => {
+			},
+			LdkEvent::PaymentFailed { payment_hash, reason, .. } => {
 				log_info!(
 					self.logger,
-					"Failed to send payment to payment hash {:?}.",
-					hex_utils::to_string(&payment_hash.0)
+					"Failed to send payment to payment hash {:?} due to {:?}.",
+					hex_utils::to_string(&payment_hash.0),
+					reason
 				);
 
 				let update = PaymentDetailsUpdate {
@@ -586,19 +633,19 @@ where
 					log_error!(self.logger, "Failed to access payment store: {}", e);
 					panic!("Failed to access payment store");
 				});
-				self.event_queue.add_event(Event::PaymentFailed { payment_hash }).unwrap_or_else(
-					|e| {
+				self.event_queue
+					.add_event(Event::PaymentFailed { payment_hash, reason })
+					.unwrap_or_else(|e| {
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
 						panic!("Failed to push to event queue");
-					},
-				);
-			}
+					});
+			},
 
-			LdkEvent::PaymentPathSuccessful { .. } => {}
-			LdkEvent::PaymentPathFailed { .. } => {}
-			LdkEvent::ProbeSuccessful { .. } => {}
-			LdkEvent::ProbeFailed { .. } => {}
-			LdkEvent::HTLCHandlingFailed { .. } => {}
+			LdkEvent::PaymentPathSuccessful { .. } => {},
+			LdkEvent::PaymentPathFailed { .. } => {},
+			LdkEvent::ProbeSuccessful { .. } => {},
+			LdkEvent::ProbeFailed { .. } => {},
+			LdkEvent::HTLCHandlingFailed { .. } => {},
 			LdkEvent::PendingHTLCsForwardable { time_forwardable } => {
 				let forwarding_channel_manager = self.channel_manager.clone();
 				let min = time_forwardable.as_millis() as u64;
@@ -614,10 +661,10 @@ where
 						forwarding_channel_manager.process_pending_htlc_forwards();
 					});
 				}
-			}
+			},
 			LdkEvent::SpendableOutputs { outputs, channel_id } => {
 				self.output_sweeper.add_outputs(outputs, channel_id)
-			}
+			},
 			LdkEvent::OpenChannelRequest {
 				temporary_channel_id,
 				counterparty_node_id,
@@ -651,7 +698,7 @@ where
 							if allow_0conf { " trusted" } else { "" },
 							counterparty_node_id,
 						);
-					}
+					},
 					Err(e) => {
 						log_error!(
 							self.logger,
@@ -661,15 +708,16 @@ where
 							if allow_0conf { " trusted" } else { "" },
 							e,
 						);
-					}
+					},
 				}
-			}
+			},
 			LdkEvent::PaymentForwarded {
 				prev_channel_id,
 				next_channel_id,
-				fee_earned_msat,
+				total_fee_earned_msat,
 				claim_from_onchain_tx,
 				outbound_amount_forwarded_msat,
+				..
 			} => {
 				let read_only_network_graph = self.network_graph.read_only();
 				let nodes = read_only_network_graph.nodes();
@@ -702,7 +750,7 @@ where
 				let to_next_str =
 					format!(" to {}{}", node_str(&next_channel_id), channel_str(&next_channel_id));
 
-				let fee_earned = fee_earned_msat.unwrap_or(0);
+				let fee_earned = total_fee_earned_msat.unwrap_or(0);
 				let outbound_amount_forwarded_msat = outbound_amount_forwarded_msat.unwrap_or(0);
 				if claim_from_onchain_tx {
 					log_info!(
@@ -723,13 +771,14 @@ where
 						fee_earned,
 					);
 				}
-			}
+			},
 			LdkEvent::ChannelPending {
 				channel_id,
 				user_channel_id,
 				former_temporary_channel_id,
 				counterparty_node_id,
 				funding_txo,
+				..
 			} => {
 				log_info!(
 					self.logger,
@@ -780,7 +829,7 @@ where
 						}
 					}
 				}
-			}
+			},
 			LdkEvent::ChannelReady {
 				channel_id, user_channel_id, counterparty_node_id, ..
 			} => {
@@ -800,7 +849,7 @@ where
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
 						panic!("Failed to push to event queue");
 					});
-			}
+			},
 			LdkEvent::ChannelClosed {
 				channel_id,
 				reason,
@@ -808,23 +857,24 @@ where
 				counterparty_node_id,
 				..
 			} => {
-				log_info!(self.logger, "Channel {} closed due to: {:?}", channel_id, reason);
+				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
 				self.event_queue
 					.add_event(Event::ChannelClosed {
 						channel_id,
 						user_channel_id: UserChannelId(user_channel_id),
 						counterparty_node_id,
+						reason: Some(reason),
 					})
 					.unwrap_or_else(|e| {
 						log_error!(self.logger, "Failed to push to event queue: {}", e);
 						panic!("Failed to push to event queue");
 					});
-			}
-			LdkEvent::DiscardFunding { .. } => {}
-			LdkEvent::HTLCIntercepted { .. } => {}
-			LdkEvent::BumpTransaction(_) => {}
-			LdkEvent::InvoiceRequestFailed { .. } => {}
-			LdkEvent::ConnectionNeeded { .. } => {}
+			},
+			LdkEvent::DiscardFunding { .. } => {},
+			LdkEvent::HTLCIntercepted { .. } => {},
+			LdkEvent::BumpTransaction(_) => {},
+			LdkEvent::InvoiceRequestFailed { .. } => {},
+			LdkEvent::ConnectionNeeded { .. } => {},
 		}
 	}
 }

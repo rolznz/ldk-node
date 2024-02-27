@@ -23,7 +23,7 @@ use bitcoin::bech32::u5;
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
-use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, Signing};
+use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey, Signing};
 use bitcoin::{ScriptBuf, Transaction, TxOut, Txid};
 
 use std::ops::Deref;
@@ -75,7 +75,7 @@ where
 				drop(guard);
 				cvar.notify_all();
 				return Ok(());
-			}
+			},
 		};
 
 		let sync_options = SyncOptions { progress: None };
@@ -96,16 +96,16 @@ where
 							.sync(&self.blockchain, sync_options)
 							.await
 							.map_err(|e| From::from(e))
-					}
+					},
 					_ => {
 						log_error!(self.logger, "Sync failed due to Esplora error: {}", e);
 						Err(From::from(e))
-					}
+					},
 				},
 				_ => {
 					log_error!(self.logger, "Wallet sync error: {}", e);
 					Err(From::from(e))
-				}
+				},
 			},
 		};
 
@@ -135,11 +135,11 @@ where
 			Ok((psbt, _)) => {
 				log_trace!(self.logger, "Created funding PSBT: {:?}", psbt);
 				psbt
-			}
+			},
 			Err(err) => {
 				log_error!(self.logger, "Failed to create funding transaction: {}", err);
 				return Err(err.into());
-			}
+			},
 		};
 
 		match locked_wallet.sign(&mut psbt, SignOptions::default()) {
@@ -147,11 +147,11 @@ where
 				if !finalized {
 					return Err(Error::OnchainTxCreationFailed);
 				}
-			}
+			},
 			Err(err) => {
 				log_error!(self.logger, "Failed to create funding transaction: {}", err);
 				return Err(err.into());
-			}
+			},
 		}
 
 		Ok(psbt.extract_tx())
@@ -199,11 +199,11 @@ where
 				Ok((psbt, _)) => {
 					log_trace!(self.logger, "Created PSBT: {:?}", psbt);
 					psbt
-				}
+				},
 				Err(err) => {
 					log_error!(self.logger, "Failed to create transaction: {}", err);
 					return Err(err.into());
-				}
+				},
 			};
 
 			match locked_wallet.sign(&mut psbt, SignOptions::default()) {
@@ -211,11 +211,11 @@ where
 					if !finalized {
 						return Err(Error::OnchainTxCreationFailed);
 					}
-				}
+				},
 				Err(err) => {
 					log_error!(self.logger, "Failed to create transaction: {}", err);
 					return Err(err.into());
-				}
+				},
 			}
 			psbt.extract_tx()
 		};
@@ -297,6 +297,10 @@ where
 	pub fn sign_message(&self, msg: &[u8]) -> Result<String, Error> {
 		message_signing::sign(msg, &self.inner.get_node_secret_key())
 			.or(Err(Error::MessageSigningFailed))
+	}
+
+	pub fn get_node_secret_key(&self) -> SecretKey {
+		self.inner.get_node_secret_key()
 	}
 
 	pub fn verify_signature(&self, msg: &[u8], sig: &str, pkey: &PublicKey) -> bool {
@@ -402,14 +406,14 @@ where
 				ShutdownScript::new_witness_program(&program).map_err(|e| {
 					log_error!(self.logger, "Invalid shutdown script: {:?}", e);
 				})
-			}
+			},
 			_ => {
 				log_error!(
 					self.logger,
 					"Tried to use a non-witness address. This must never happen."
 				);
 				panic!("Tried to use a non-witness address. This must never happen.");
-			}
+			},
 		}
 	}
 }
